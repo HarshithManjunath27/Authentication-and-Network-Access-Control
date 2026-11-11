@@ -56,6 +56,15 @@ def open_session(username, client_ip):
         SESSIONS[(username, client_ip)] = {'login_time': now, 'last_seen': now, 'state': 'ACTIVE'}
     return True
 
+def touch_session(username, client_ip):
+    """Record a heartbeat. Returns False if the session is not ACTIVE (it ended, or never existed)."""
+    with SESSIONS_LOCK:
+        session = SESSIONS.get((username, client_ip))
+        if session is None or session['state'] != 'ACTIVE':
+            return False
+        session['last_seen'] = time.monotonic()
+        return True
+
 def close_session(username, client_ip, reason):
     """End an ACTIVE session: revoke access and record why. Returns False if it was not active."""
     with SESSIONS_LOCK:
@@ -76,6 +85,30 @@ def session_timer(username, client_ip):
     logging.info(f"Session active for '{username}' at {client_ip}. Ending in {SESSION_TIMEOUT}s.")
     time.sleep(SESSION_TIMEOUT)
     close_session(username, client_ip, 'TIMEOUT')
+
+def session_loop(conn, username, client_ip):
+    """After login, read one-line commands until the client logs out or disconnects.
+    HEARTBEAT -> reply OK (or EXPIRED if the session has already ended, then we hang up)
+    LOGOUT    -> end the session right now, reply BYE, hang up"""
+    conn.settimeout(SESSION_TIMEOUT * 2)  # a client that vanishes must not hold this thread forever
+    while True:
+        data = conn.recv(1024)
+        if not data:
+            return  # client closed the connection without LOGOUT: the session simply times out later
+        for line in data.decode('utf-8', errors='replace').splitlines():
+            command = line.strip().upper()
+            if command == 'HEARTBEAT':
+                if touch_session(username, client_ip):
+                    conn.send(b"OK\n")
+                else:
+                    conn.send(b"EXPIRED\n")
+                    return
+            elif command == 'LOGOUT':
+                close_session(username, client_ip, 'LOGGED_OUT')
+                conn.send(b"BYE\n")
+                return
+            elif command:
+                conn.send(b"ERR unknown command\n")
 
 def handle_client(conn, addr):
     client_ip = addr[0]
@@ -104,11 +137,14 @@ def handle_client(conn, addr):
             if open_session(username, client_ip):
                 conn.send(f"[+] SUCCESS: Network access granted to {TARGET_IP}.\n".encode('utf-8'))
                 threading.Thread(target=session_timer, args=(username, client_ip), daemon=True).start()
+                session_loop(conn, username, client_ip)
             else:
                 conn.send(b"[-] ERROR: Controller refused rule injection.\n")
         else:
             logging.warning(f"AUTH FAILED: Invalid credentials from {client_ip}")
             conn.send(b"[-] DENIED: Invalid credentials.\n")
+    except socket.timeout:
+        logging.info(f"Connection from {client_ip} timed out and was closed.")
     except Exception as e:
         logging.error(f"Socket fault with {client_ip}: {e}")
     finally:
