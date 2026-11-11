@@ -45,10 +45,12 @@ with open('users.json', 'r') as f:
 SESSIONS = {}
 SESSIONS_LOCK = threading.Lock()
 
-def controller_call(url, client_ip):
-    """Ask the controller to grant or revoke client_ip -> TARGET_IP. True if it answered 200."""
+def controller_call(url, client_ip, reason):
+    """Ask the controller to grant or revoke client_ip -> TARGET_IP. True if it answered 200.
+    The reason (LOGIN, LOGGED_OUT, IDLE_TIMEOUT, ...) is only used for the controller's log."""
     try:
-        resp = requests.post(url, json={'src_ip': client_ip, 'dst_ip': TARGET_IP}, headers=API_HEADERS, timeout=5)
+        resp = requests.post(url, json={'src_ip': client_ip, 'dst_ip': TARGET_IP, 'reason': reason},
+                             headers=API_HEADERS, timeout=5)
         return resp.status_code == 200
     except Exception as e:
         logging.error(f"Controller call {url} failed for {client_ip}: {e}")
@@ -57,7 +59,7 @@ def controller_call(url, client_ip):
 def open_session(username, client_ip):
     """Grant access on the switch, then record the session. Returns True on success."""
     with SESSIONS_LOCK:
-        if not controller_call(RYU_GRANT, client_ip):
+        if not controller_call(RYU_GRANT, client_ip, 'LOGIN'):
             return False
         now = time.monotonic()
         SESSIONS[(username, client_ip)] = {'login_time': now, 'last_seen': now, 'state': 'ACTIVE'}
@@ -79,11 +81,18 @@ def end_session_locked(username, client_ip, reason):
     if session is None or session['state'] != 'ACTIVE':
         return False
     session['state'] = reason
-    # If the revoke fails, the switch rules still disappear on their own timeout.
-    revoked = controller_call(RYU_REVOKE, client_ip)
+    # The switch rules belong to the client IP, not to the user. If another user is still logged in
+    # from the same IP, they need those rules, so keep them and let that session remove them later.
+    shared = any(ip == client_ip and other['state'] == 'ACTIVE'
+                 for (user, ip), other in SESSIONS.items() if (user, ip) != (username, client_ip))
+    if shared:
+        outcome = 'skipped (another session from this IP is still active)'
+    else:
+        # If the revoke fails, the switch rules still disappear on their own timeout.
+        outcome = 'ok' if controller_call(RYU_REVOKE, client_ip, reason) else 'FAILED'
     lasted = time.monotonic() - session['login_time']
     logging.info(f"Session ended: user '{username}' ip {client_ip} reason={reason} "
-                 f"after {lasted:.0f}s revoke={'ok' if revoked else 'FAILED'}")
+                 f"after {lasted:.0f}s revoke={outcome}")
     return True
 
 def close_session(username, client_ip, reason):
@@ -177,7 +186,7 @@ def serve(listener):
         conn, addr = listener.accept()
         threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
 
-if __name__ == '__main__':
+def main():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(('0.0.0.0', 9999))
@@ -185,3 +194,6 @@ if __name__ == '__main__':
     print("[*] Multithreaded Auth Server listening on port 9999...")
     threading.Thread(target=reap_expired_sessions, daemon=True).start()
     serve(server)
+
+if __name__ == '__main__':
+    main()

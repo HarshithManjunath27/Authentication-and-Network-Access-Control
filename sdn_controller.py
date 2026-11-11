@@ -1,9 +1,11 @@
 import hmac
+import ipaddress
 import json
 import os
+import re
 from ryu.base import app_manager
 from ryu.controller import ofp_event
-from ryu.controller.handler import CONFIG_DISPATCHER, set_ev_cls
+from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.app.wsgi import ControllerBase, WSGIApplication, route, Response
 from ryu.lib.packet import ether_types
@@ -68,35 +70,55 @@ class AuthController(app_manager.RyuApp):
             in_port=ofproto.OFPP_LOCAL, eth_type=ether_types.ETH_TYPE_IP, ipv4_src=API_IP,
             ipv4_dst=H2_IP, ip_proto=6, tcp_src=API_PORT), [parser.OFPActionOutput(H2_PORT)])
 
-    def add_flow(self, datapath, priority, match, actions, idle_timeout=0, hard_timeout=0):
+    def add_flow(self, datapath, priority, match, actions, idle_timeout=0, hard_timeout=0, flags=0):
         inst = [datapath.ofproto_parser.OFPInstructionActions(datapath.ofproto.OFPIT_APPLY_ACTIONS, actions)]
-        mod = datapath.ofproto_parser.OFPFlowMod(datapath=datapath, priority=priority, match=match, instructions=inst, idle_timeout=idle_timeout, hard_timeout=hard_timeout)
+        mod = datapath.ofproto_parser.OFPFlowMod(datapath=datapath, priority=priority, match=match, instructions=inst, idle_timeout=idle_timeout, hard_timeout=hard_timeout, flags=flags)
         datapath.send_msg(mod)
 
-    def grant_access(self, src_ip, dst_ip):
+    def log_rule(self, event, client, target, direction, reason, extra=''):
+        """One log line per rule: what happened, for which client and target, and why. Never log the token."""
+        self.logger.info(f"RULE {event} client={client} target={target} direction={direction} reason={reason}{extra}")
+
+    def grant_access(self, src_ip, dst_ip, reason='LOGIN'):
+        """Install the two priority-100 rules that let src_ip (the client) and dst_ip (the target) talk."""
         if not self.datapath: return False
         ofproto, parser = self.datapath.ofproto, self.datapath.ofproto_parser
         actions = [parser.OFPActionOutput(ofproto.OFPP_ALL), parser.OFPActionOutput(ofproto.OFPP_LOCAL)]
-        
-        self.add_flow(self.datapath, 100, parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=src_ip, ipv4_dst=dst_ip), actions, hard_timeout=HARD_TIMEOUT)
-        self.add_flow(self.datapath, 100, parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=dst_ip, ipv4_dst=src_ip), actions, hard_timeout=HARD_TIMEOUT)
-        self.logger.info(f"[+] GRANTED: Access for {src_ip} to {dst_ip}")
+        # SEND_FLOW_REM makes the switch tell us when it removes a rule by itself (a timeout).
+        flags = ofproto.OFPFF_SEND_FLOW_REM
+        # Installing the same rule twice just overwrites it, so logging in again never creates duplicates.
+        for a, b, direction in ((src_ip, dst_ip, 'client->target'), (dst_ip, src_ip, 'target->client')):
+            match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=a, ipv4_dst=b)
+            self.add_flow(self.datapath, 100, match, actions, hard_timeout=HARD_TIMEOUT, flags=flags)
+            self.log_rule('INSTALLED', src_ip, dst_ip, direction, reason, f' priority=100 hard_timeout={HARD_TIMEOUT}')
         return True
 
-    def revoke_access(self, src_ip, dst_ip):
+    def revoke_access(self, src_ip, dst_ip, reason='UNSPECIFIED'):
+        """Remove exactly the two priority-100 rules for this client and target, and nothing else."""
         if not self.datapath: return False
         ofproto, parser = self.datapath.ofproto, self.datapath.ofproto_parser
-        
-        match_fwd = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=src_ip, ipv4_dst=dst_ip)
-        mod_fwd = parser.OFPFlowMod(datapath=self.datapath, command=ofproto.OFPFC_DELETE, out_port=ofproto.OFPP_ANY, out_group=ofproto.OFPG_ANY, priority=100, match=match_fwd)
-        self.datapath.send_msg(mod_fwd)
-        
-        match_rev = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=dst_ip, ipv4_dst=src_ip)
-        mod_rev = parser.OFPFlowMod(datapath=self.datapath, command=ofproto.OFPFC_DELETE, out_port=ofproto.OFPP_ANY, out_group=ofproto.OFPG_ANY, priority=100, match=match_rev)
-        self.datapath.send_msg(mod_rev)
-        
-        self.logger.info(f"[-] REVOKED: Access removed for {src_ip}")
+        for a, b, direction in ((src_ip, dst_ip, 'client->target'), (dst_ip, src_ip, 'target->client')):
+            match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=a, ipv4_dst=b)
+            # DELETE_STRICT only removes a rule with exactly this match AND priority 100. The plain DELETE
+            # command ignores the priority and also removes every more specific rule (e.g. the API lockdown).
+            mod = parser.OFPFlowMod(datapath=self.datapath, command=ofproto.OFPFC_DELETE_STRICT,
+                                    out_port=ofproto.OFPP_ANY, out_group=ofproto.OFPG_ANY, priority=100, match=match)
+            self.datapath.send_msg(mod)
+            # Deleting a rule that is already gone is not an error in OpenFlow: the switch just ignores it.
+            self.log_rule('REMOVED', src_ip, dst_ip, direction, reason)
         return True
+
+    @set_ev_cls(ofp_event.EventOFPFlowRemoved, MAIN_DISPATCHER)
+    def flow_removed_handler(self, ev):
+        """The switch reports a rule it removed on its own. Removals we ordered are already logged by
+        revoke_access, so only timeouts are logged here."""
+        msg = ev.msg
+        ofproto = msg.datapath.ofproto
+        reasons = {ofproto.OFPRR_IDLE_TIMEOUT: 'IDLE_TIMEOUT_BY_SWITCH', ofproto.OFPRR_HARD_TIMEOUT: 'HARD_TIMEOUT_BY_SWITCH'}
+        if msg.priority != 100 or msg.reason not in reasons:
+            return
+        self.logger.info(f"RULE REMOVED src={msg.match['ipv4_src']} dst={msg.match['ipv4_dst']} "
+                         f"reason={reasons[msg.reason]} packets={msg.packet_count} bytes={msg.byte_count}")
 
 class AuthRestAPI(ControllerBase):
     def __init__(self, req, link, data, **config):
@@ -114,18 +136,38 @@ class AuthRestAPI(ControllerBase):
             return Response(status=401, content_type='application/json', body=json.dumps({'error': 'unauthorized'}))
         return None
 
+    def json_reply(self, status, data):
+        return Response(status=status, content_type='application/json', body=json.dumps(data))
+
+    def read_request(self, req):
+        """Return (src_ip, dst_ip, reason) from the JSON body, or None if it is missing or malformed."""
+        try:
+            body = req.json if req.body else {}
+            src = str(ipaddress.IPv4Address(body.get('src_ip')))
+            dst = str(ipaddress.IPv4Address(body.get('dst_ip')))
+            # The reason only goes into the log, so keep it to harmless characters (no newlines).
+            reason = re.sub(r'[^A-Za-z0-9_]', '', str(body.get('reason', '')))[:32] or 'UNSPECIFIED'
+        except (ValueError, AttributeError, TypeError):
+            return None
+        return src, dst, reason
+
     @route('auth', '/auth/grant', methods=['POST'])
     def grant_handler(self, req, **kwargs):
         denied = self.check_caller(req)
         if denied: return denied
-        body = req.json if req.body else {}
-        if self.app.grant_access(body.get('src_ip'), body.get('dst_ip')): return json.dumps({'status': 'success'})
-        return json.dumps({'error': 'Switch not connected'})
+        parsed = self.read_request(req)
+        if parsed is None:
+            return self.json_reply(400, {'error': 'src_ip and dst_ip must be valid IPv4 addresses'})
+        if self.app.grant_access(*parsed): return self.json_reply(200, {'status': 'success'})
+        return self.json_reply(503, {'error': 'Switch not connected'})
 
     @route('auth', '/auth/revoke', methods=['POST'])
     def revoke_handler(self, req, **kwargs):
         denied = self.check_caller(req)
         if denied: return denied
-        body = req.json if req.body else {}
-        if self.app.revoke_access(body.get('src_ip'), body.get('dst_ip')): return json.dumps({'status': 'success'})
-        return json.dumps({'error': 'Switch not connected'})
+        parsed = self.read_request(req)
+        if parsed is None:
+            return self.json_reply(400, {'error': 'src_ip and dst_ip must be valid IPv4 addresses'})
+        # Revoking a session that is already gone is fine: the answer is still success.
+        if self.app.revoke_access(*parsed): return self.json_reply(200, {'status': 'success'})
+        return self.json_reply(503, {'error': 'Switch not connected'})
