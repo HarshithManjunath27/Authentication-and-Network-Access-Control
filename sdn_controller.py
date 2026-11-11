@@ -20,6 +20,10 @@ API_IP = '10.0.0.254'
 API_PORT = 8080
 # The shared secret is read from this untracked file (start.sh creates it). It is never logged.
 TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'api_token')
+# Safety net: every access rule disappears by itself this many seconds after it was installed, even if
+# the auth server crashes and never sends a revoke. Keep it a bit longer than ABSOLUTE_LIMIT (120 s)
+# in auth_server.py, so normal session endings always happen first.
+HARD_TIMEOUT = 150
 
 class AuthController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -64,9 +68,9 @@ class AuthController(app_manager.RyuApp):
             in_port=ofproto.OFPP_LOCAL, eth_type=ether_types.ETH_TYPE_IP, ipv4_src=API_IP,
             ipv4_dst=H2_IP, ip_proto=6, tcp_src=API_PORT), [parser.OFPActionOutput(H2_PORT)])
 
-    def add_flow(self, datapath, priority, match, actions, idle_timeout=0):
+    def add_flow(self, datapath, priority, match, actions, idle_timeout=0, hard_timeout=0):
         inst = [datapath.ofproto_parser.OFPInstructionActions(datapath.ofproto.OFPIT_APPLY_ACTIONS, actions)]
-        mod = datapath.ofproto_parser.OFPFlowMod(datapath=datapath, priority=priority, match=match, instructions=inst, idle_timeout=idle_timeout)
+        mod = datapath.ofproto_parser.OFPFlowMod(datapath=datapath, priority=priority, match=match, instructions=inst, idle_timeout=idle_timeout, hard_timeout=hard_timeout)
         datapath.send_msg(mod)
 
     def grant_access(self, src_ip, dst_ip):
@@ -74,8 +78,8 @@ class AuthController(app_manager.RyuApp):
         ofproto, parser = self.datapath.ofproto, self.datapath.ofproto_parser
         actions = [parser.OFPActionOutput(ofproto.OFPP_ALL), parser.OFPActionOutput(ofproto.OFPP_LOCAL)]
         
-        self.add_flow(self.datapath, 100, parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=src_ip, ipv4_dst=dst_ip), actions, idle_timeout=60)
-        self.add_flow(self.datapath, 100, parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=dst_ip, ipv4_dst=src_ip), actions, idle_timeout=60)
+        self.add_flow(self.datapath, 100, parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=src_ip, ipv4_dst=dst_ip), actions, hard_timeout=HARD_TIMEOUT)
+        self.add_flow(self.datapath, 100, parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=dst_ip, ipv4_dst=src_ip), actions, hard_timeout=HARD_TIMEOUT)
         self.logger.info(f"[+] GRANTED: Access for {src_ip} to {dst_ip}")
         return True
 
