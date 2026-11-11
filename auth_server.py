@@ -6,13 +6,20 @@ import time
 import json
 import os
 
+# ---------------------------------------------------------------------------
+# Session settings (short demo values; use longer ones in real use)
+# ---------------------------------------------------------------------------
+HEARTBEAT_INTERVAL = 5   # seconds between the client's heartbeats (the client is told at login)
+IDLE_TIMEOUT = 15        # no heartbeat for this long -> the session ends and access is revoked
+ABSOLUTE_LIMIT = 120     # a session ends this long after login, however many heartbeats arrive
+REAPER_INTERVAL = 1      # how often the reaper thread looks for expired sessions
+
 # Initialize Audit Logger
 logging.basicConfig(filename='auth_audit.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 RYU_GRANT = 'http://10.0.0.254:8080/auth/grant'
 RYU_REVOKE = 'http://10.0.0.254:8080/auth/revoke'
 TARGET_IP = '10.0.0.3'
-SESSION_TIMEOUT = 60
 
 # Secret shared with the controller; sent in the X-Auth-Token header on every API call.
 # Read from the untracked api_token file next to this script. Never log it.
@@ -65,32 +72,46 @@ def touch_session(username, client_ip):
         session['last_seen'] = time.monotonic()
         return True
 
-def close_session(username, client_ip, reason):
-    """End an ACTIVE session: revoke access and record why. Returns False if it was not active."""
-    with SESSIONS_LOCK:
-        session = SESSIONS.get((username, client_ip))
-        if session is None or session['state'] != 'ACTIVE':
-            return False
-        session['state'] = reason
-        # If the revoke fails, the switch rules still disappear on their own timeout.
-        revoked = controller_call(RYU_REVOKE, client_ip)
-        lasted = time.monotonic() - session['login_time']
+def end_session_locked(username, client_ip, reason):
+    """End an ACTIVE session: revoke access and record why. The caller must hold SESSIONS_LOCK.
+    Returns False if the session was not active."""
+    session = SESSIONS.get((username, client_ip))
+    if session is None or session['state'] != 'ACTIVE':
+        return False
+    session['state'] = reason
+    # If the revoke fails, the switch rules still disappear on their own timeout.
+    revoked = controller_call(RYU_REVOKE, client_ip)
+    lasted = time.monotonic() - session['login_time']
     logging.info(f"Session ended: user '{username}' ip {client_ip} reason={reason} "
                  f"after {lasted:.0f}s revoke={'ok' if revoked else 'FAILED'}")
     return True
 
-# Temporary: the old fixed 60 s timer, now going through the session table.
-# Step (c) replaces it with idle and absolute timeouts.
-def session_timer(username, client_ip):
-    logging.info(f"Session active for '{username}' at {client_ip}. Ending in {SESSION_TIMEOUT}s.")
-    time.sleep(SESSION_TIMEOUT)
-    close_session(username, client_ip, 'TIMEOUT')
+def close_session(username, client_ip, reason):
+    with SESSIONS_LOCK:
+        return end_session_locked(username, client_ip, reason)
+
+def reap_expired_sessions():
+    """Background thread: every REAPER_INTERVAL seconds end sessions that are idle for too long
+    (no heartbeat for IDLE_TIMEOUT) or that have lived longer than ABSOLUTE_LIMIT.
+    The check and the ending happen under one lock hold, so a heartbeat that arrives just in time
+    cannot be thrown away by a decision made a moment earlier."""
+    while True:
+        time.sleep(REAPER_INTERVAL)
+        now = time.monotonic()
+        with SESSIONS_LOCK:
+            for (username, client_ip), session in SESSIONS.items():
+                if session['state'] != 'ACTIVE':
+                    continue
+                if now - session['last_seen'] > IDLE_TIMEOUT:
+                    end_session_locked(username, client_ip, 'IDLE_TIMEOUT')
+                elif now - session['login_time'] > ABSOLUTE_LIMIT:
+                    end_session_locked(username, client_ip, 'ABSOLUTE_LIMIT')
 
 def session_loop(conn, username, client_ip):
     """After login, read one-line commands until the client logs out or disconnects.
     HEARTBEAT -> reply OK (or EXPIRED if the session has already ended, then we hang up)
     LOGOUT    -> end the session right now, reply BYE, hang up"""
-    conn.settimeout(SESSION_TIMEOUT * 2)  # a client that vanishes must not hold this thread forever
+    conn.settimeout(IDLE_TIMEOUT * 2)  # a client that vanishes must not hold this thread forever
     while True:
         data = conn.recv(1024)
         if not data:
@@ -135,8 +156,8 @@ def handle_client(conn, addr):
         if USER_DB.get(username) == password:
             logging.info(f"AUTH SUCCESS: User '{username}' via IP {client_ip}")
             if open_session(username, client_ip):
-                conn.send(f"[+] SUCCESS: Network access granted to {TARGET_IP}.\n".encode('utf-8'))
-                threading.Thread(target=session_timer, args=(username, client_ip), daemon=True).start()
+                conn.send(f"[+] SUCCESS: Network access granted to {TARGET_IP}. "
+                          f"HEARTBEAT_INTERVAL={HEARTBEAT_INTERVAL}\n".encode('utf-8'))
                 session_loop(conn, username, client_ip)
             else:
                 conn.send(b"[-] ERROR: Controller refused rule injection.\n")
@@ -162,4 +183,5 @@ if __name__ == '__main__':
     server.bind(('0.0.0.0', 9999))
     server.listen(10)
     print("[*] Multithreaded Auth Server listening on port 9999...")
+    threading.Thread(target=reap_expired_sessions, daemon=True).start()
     serve(server)
