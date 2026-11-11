@@ -4,6 +4,7 @@ import requests
 import logging
 import time
 import json
+import os
 
 # Initialize Audit Logger
 logging.basicConfig(filename='auth_audit.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -13,6 +14,11 @@ RYU_REVOKE = 'http://10.0.0.254:8080/auth/revoke'
 TARGET_IP = '10.0.0.3'
 SESSION_TIMEOUT = 60
 
+# Secret shared with the controller; sent in the X-Auth-Token header on every API call.
+# Read from the untracked api_token file next to this script. Never log it.
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'api_token')) as f:
+    API_HEADERS = {'X-Auth-Token': f.read().strip()}
+
 # Load users (Assumes users.json exists in your directory)
 with open('users.json', 'r') as f:
     USER_DB = json.load(f)
@@ -21,7 +27,7 @@ def session_timer(client_ip):
     logging.info(f"Session active for {client_ip}. Revoking in {SESSION_TIMEOUT}s.")
     time.sleep(SESSION_TIMEOUT)
     try:
-        requests.post(RYU_REVOKE, json={'src_ip': client_ip, 'dst_ip': TARGET_IP}, timeout=5)
+        requests.post(RYU_REVOKE, json={'src_ip': client_ip, 'dst_ip': TARGET_IP}, headers=API_HEADERS, timeout=5)
         logging.info(f"Session EXPIRED: Rule revoked for {client_ip}.")
     except Exception as e:
         logging.error(f"Revocation API failed for {client_ip}: {e}")
@@ -50,7 +56,7 @@ def handle_client(conn, addr):
         
         if USER_DB.get(username) == password:
             logging.info(f"AUTH SUCCESS: User '{username}' via IP {client_ip}")
-            resp = requests.post(RYU_GRANT, json={'src_ip': client_ip, 'dst_ip': TARGET_IP}, timeout=5)
+            resp = requests.post(RYU_GRANT, json={'src_ip': client_ip, 'dst_ip': TARGET_IP}, headers=API_HEADERS, timeout=5)
             
             if resp.status_code == 200:
                 conn.send(f"[+] SUCCESS: Network access granted to {TARGET_IP}.\n".encode('utf-8'))
