@@ -23,11 +23,13 @@ def run_client():
         s.settimeout(5)
         s.connect((AUTH_SERVER_IP, AUTH_SERVER_PORT))
         s.send(json.dumps(req).encode('utf-8'))
-        response = s.recv(1024).decode('utf-8')
-        
-        if response == "SUCCESS":
+        response = s.recv(1024).decode('utf-8').strip()
+
+        # The server replies with a whole line such as "[+] SUCCESS: Network access granted ...",
+        # so look for the keyword instead of comparing the entire string.
+        if "SUCCESS" in response:
             print(f"\n[+] SUCCESS: Network access granted to {TARGET_IP}.")
-        elif response == "FAIL":
+        elif "DENIED" in response:
             print("\n[-] DENIED: Invalid credentials.")
         else:
             print(f"\n[-] ERROR: {response}")
