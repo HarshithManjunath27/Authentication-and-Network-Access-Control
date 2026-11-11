@@ -23,14 +23,59 @@ with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'api_token'))
 with open('users.json', 'r') as f:
     USER_DB = json.load(f)
 
-def session_timer(client_ip):
-    logging.info(f"Session active for {client_ip}. Revoking in {SESSION_TIMEOUT}s.")
-    time.sleep(SESSION_TIMEOUT)
+# ---------------------------------------------------------------------------
+# Session table
+# One entry per logged-in user and client IP: (username, ip) -> details.
+#   login_time / last_seen : time.monotonic() values (a clock that never jumps backwards)
+#   state                  : 'ACTIVE' while access is granted. When the session ends it is
+#                            overwritten with the reason ('LOGGED_OUT', 'TIMEOUT', ...), so the
+#                            table also shows how each session ended.
+# SESSIONS_LOCK is the one lock for the table. Controller calls are made while holding it, so the
+# table and the switch rules always change in the same order (a revoke can never overtake a
+# newer grant). The cost: if the controller hangs, other session updates wait up to 5 seconds.
+# Note: the switch rules are per client IP, so two users logged in from the same IP share them.
+# ---------------------------------------------------------------------------
+SESSIONS = {}
+SESSIONS_LOCK = threading.Lock()
+
+def controller_call(url, client_ip):
+    """Ask the controller to grant or revoke client_ip -> TARGET_IP. True if it answered 200."""
     try:
-        requests.post(RYU_REVOKE, json={'src_ip': client_ip, 'dst_ip': TARGET_IP}, headers=API_HEADERS, timeout=5)
-        logging.info(f"Session EXPIRED: Rule revoked for {client_ip}.")
+        resp = requests.post(url, json={'src_ip': client_ip, 'dst_ip': TARGET_IP}, headers=API_HEADERS, timeout=5)
+        return resp.status_code == 200
     except Exception as e:
-        logging.error(f"Revocation API failed for {client_ip}: {e}")
+        logging.error(f"Controller call {url} failed for {client_ip}: {e}")
+        return False
+
+def open_session(username, client_ip):
+    """Grant access on the switch, then record the session. Returns True on success."""
+    with SESSIONS_LOCK:
+        if not controller_call(RYU_GRANT, client_ip):
+            return False
+        now = time.monotonic()
+        SESSIONS[(username, client_ip)] = {'login_time': now, 'last_seen': now, 'state': 'ACTIVE'}
+    return True
+
+def close_session(username, client_ip, reason):
+    """End an ACTIVE session: revoke access and record why. Returns False if it was not active."""
+    with SESSIONS_LOCK:
+        session = SESSIONS.get((username, client_ip))
+        if session is None or session['state'] != 'ACTIVE':
+            return False
+        session['state'] = reason
+        # If the revoke fails, the switch rules still disappear on their own timeout.
+        revoked = controller_call(RYU_REVOKE, client_ip)
+        lasted = time.monotonic() - session['login_time']
+    logging.info(f"Session ended: user '{username}' ip {client_ip} reason={reason} "
+                 f"after {lasted:.0f}s revoke={'ok' if revoked else 'FAILED'}")
+    return True
+
+# Temporary: the old fixed 60 s timer, now going through the session table.
+# Step (c) replaces it with idle and absolute timeouts.
+def session_timer(username, client_ip):
+    logging.info(f"Session active for '{username}' at {client_ip}. Ending in {SESSION_TIMEOUT}s.")
+    time.sleep(SESSION_TIMEOUT)
+    close_session(username, client_ip, 'TIMEOUT')
 
 def handle_client(conn, addr):
     client_ip = addr[0]
@@ -56,11 +101,9 @@ def handle_client(conn, addr):
         
         if USER_DB.get(username) == password:
             logging.info(f"AUTH SUCCESS: User '{username}' via IP {client_ip}")
-            resp = requests.post(RYU_GRANT, json={'src_ip': client_ip, 'dst_ip': TARGET_IP}, headers=API_HEADERS, timeout=5)
-            
-            if resp.status_code == 200:
+            if open_session(username, client_ip):
                 conn.send(f"[+] SUCCESS: Network access granted to {TARGET_IP}.\n".encode('utf-8'))
-                threading.Thread(target=session_timer, args=(client_ip,), daemon=True).start()
+                threading.Thread(target=session_timer, args=(username, client_ip), daemon=True).start()
             else:
                 conn.send(b"[-] ERROR: Controller refused rule injection.\n")
         else:
@@ -71,12 +114,16 @@ def handle_client(conn, addr):
     finally:
         conn.close()
 
-server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-server.bind(('0.0.0.0', 9999))
-server.listen(10)
-print("[*] Multithreaded Auth Server listening on port 9999...")
+def serve(listener):
+    """Accept connections forever, one thread per client."""
+    while True:
+        conn, addr = listener.accept()
+        threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
 
-while True:
-    conn, addr = server.accept()
-    threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+if __name__ == '__main__':
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(('0.0.0.0', 9999))
+    server.listen(10)
+    print("[*] Multithreaded Auth Server listening on port 9999...")
+    serve(server)
