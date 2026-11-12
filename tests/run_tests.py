@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -143,7 +144,7 @@ def main():
         # 6. (runs while the block counts down) an ordinary host can not use the REST API
         api = []
         for host in (h4, h3):
-            code = host.cmd('curl -s -m 3 -o /dev/null -w "%{http_code}" -X POST -H "Content-Type: application/json" '
+            code = host.cmd('curl -s -m 3 -o /dev/null -w "%%{http_code}" -X POST -H "Content-Type: application/json" '
                             '-d \'{"src_ip":"%s","dst_ip":"10.0.0.3"}\' http://10.0.0.254:8080/auth/grant' % host.IP()).strip()
             api.append(code == '000')
         report(6, 'an ordinary host can not reach the REST API',
@@ -157,6 +158,8 @@ def main():
         report(5, '3 wrong passwords create the %d s drop rule and cut the host off' % BLOCK_SECONDS,
                part_a and back,
                detail + '; lifted by the switch after about %.0f s: %s' % (time.time() - blocked_at, back))
+    except Exception:
+        traceback.print_exc()          # the summary below then shows which checks did not run
     finally:
         h2.cmd('kill %d 2>/dev/null' % server_pid)
         subprocess.run(['pkill', '-f', tmp], capture_output=True)   # a client left waiting on its FIFO
