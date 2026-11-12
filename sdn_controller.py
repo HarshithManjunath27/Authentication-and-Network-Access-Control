@@ -26,6 +26,11 @@ TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'api_token
 # the auth server crashes and never sends a revoke. Keep it a bit longer than ABSOLUTE_LIMIT (120 s)
 # in auth_server.py, so normal session endings always happen first.
 HARD_TIMEOUT = 150
+# Brute-force block: a drop rule for one host, placed above every other rule (the highest other priority
+# is 100, the access rules). The switch removes it by itself after BLOCK_TIMEOUT seconds (hard_timeout).
+# Keep BLOCK_TIMEOUT equal to BLOCK_SECONDS in auth_server.py, which is what the user is told.
+BLOCK_PRIORITY = 200
+BLOCK_TIMEOUT = 60
 
 class AuthController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -108,6 +113,16 @@ class AuthController(app_manager.RyuApp):
             self.log_rule('REMOVED', src_ip, dst_ip, direction, reason)
         return True
 
+    def block_host(self, client_ip, reason):
+        """Drop every IP packet coming from client_ip. An empty action list means drop. Because the
+        rule has a hard_timeout, the switch lifts the block by itself even if nobody ever asks it to."""
+        if not self.datapath: return False
+        match = self.datapath.ofproto_parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=client_ip)
+        self.add_flow(self.datapath, BLOCK_PRIORITY, match, [], hard_timeout=BLOCK_TIMEOUT)
+        self.logger.info(f"HOST BLOCKED client={client_ip} priority={BLOCK_PRIORITY} "
+                         f"hard_timeout={BLOCK_TIMEOUT} reason={reason}")
+        return True
+
     @set_ev_cls(ofp_event.EventOFPFlowRemoved, MAIN_DISPATCHER)
     def flow_removed_handler(self, ev):
         """The switch reports a rule it removed on its own. Removals we ordered are already logged by
@@ -170,4 +185,27 @@ class AuthRestAPI(ControllerBase):
             return self.json_reply(400, {'error': 'src_ip and dst_ip must be valid IPv4 addresses'})
         # Revoking a session that is already gone is fine: the answer is still success.
         if self.app.revoke_access(*parsed): return self.json_reply(200, {'status': 'success'})
+        return self.json_reply(503, {'error': 'Switch not connected'})
+
+    def read_block_request(self, req):
+        """Return (client_ip, reason) from the JSON body, or None if it is malformed or must not be blocked.
+        The auth server (h2) and the API address can never be blocked: that would break logins or the API."""
+        try:
+            body = req.json if req.body else {}
+            client_ip = str(ipaddress.IPv4Address(body.get('src_ip')))
+            reason = re.sub(r'[^A-Za-z0-9_]', '', str(body.get('reason', '')))[:32] or 'UNSPECIFIED'
+        except (ValueError, AttributeError, TypeError):
+            return None
+        if client_ip in (H2_IP, API_IP):
+            return None
+        return client_ip, reason
+
+    @route('auth', '/auth/block', methods=['POST'])
+    def block_handler(self, req, **kwargs):
+        denied = self.check_caller(req)
+        if denied: return denied
+        parsed = self.read_block_request(req)
+        if parsed is None:
+            return self.json_reply(400, {'error': 'src_ip must be an IPv4 address other than the auth server or the API'})
+        if self.app.block_host(*parsed): return self.json_reply(200, {'status': 'success'})
         return self.json_reply(503, {'error': 'Switch not connected'})

@@ -91,10 +91,10 @@ def run_client():
             match = re.search(r'HEARTBEAT_INTERVAL=(\d+)', response)
             interval = int(match.group(1)) if match else DEFAULT_HEARTBEAT_INTERVAL
             keep_alive(s, interval)
-        elif "DENIED" in response:
-            print("\n[-] DENIED: Invalid credentials.")
         else:
-            print(f"\n[-] ERROR: {response}")
+            # DENIED, BLOCKED or ERROR: show the server's own message, so the user sees why
+            # (for example that the host is blocked after too many wrong passwords).
+            print(f"\n{response}")
         s.close()
     except Exception as e:
         print(f"\n[-] Connection failed: {e}")

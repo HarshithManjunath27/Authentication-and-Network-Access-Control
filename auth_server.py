@@ -14,11 +14,18 @@ IDLE_TIMEOUT = 15        # no heartbeat for this long -> the session ends and ac
 ABSOLUTE_LIMIT = 120     # a session ends this long after login, however many heartbeats arrive
 REAPER_INTERVAL = 1      # how often the reaper thread looks for expired sessions
 
+# Brute-force lockout
+MAX_FAILED_LOGINS = 3    # wrong passwords in a row from one IP before that host is blocked
+BLOCK_SECONDS = 60       # what the user is told; the controller's rule really lasts BLOCK_TIMEOUT (keep equal)
+LOGIN_TIMEOUT = 10       # seconds to wait for the login message before giving up on a connection
+AUTH_SERVER_IP = '10.0.0.2'   # this server's own address: it must never be blocked
+
 # Initialize Audit Logger
 logging.basicConfig(filename='auth_audit.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 RYU_GRANT = 'http://10.0.0.254:8080/auth/grant'
 RYU_REVOKE = 'http://10.0.0.254:8080/auth/revoke'
+RYU_BLOCK = 'http://10.0.0.254:8080/auth/block'
 TARGET_IP = '10.0.0.3'
 
 # Secret shared with the controller; sent in the X-Auth-Token header on every API call.
@@ -140,9 +147,44 @@ def session_loop(conn, username, client_ip):
             elif command:
                 conn.send(b"ERR unknown command\n")
 
+# ---------------------------------------------------------------------------
+# Brute-force lockout: wrong passwords in a row, counted per client IP. FAILED_LOCK protects the counts.
+# ---------------------------------------------------------------------------
+FAILED_LOGINS = {}
+FAILED_LOCK = threading.Lock()
+
+def register_failure(client_ip):
+    """Count one wrong password from client_ip. Returns True when it was the MAX_FAILED_LOGINS-th in a
+    row, which means the host must be blocked now. The auth server's own address is never counted."""
+    if client_ip == AUTH_SERVER_IP:
+        return False
+    with FAILED_LOCK:
+        FAILED_LOGINS[client_ip] = FAILED_LOGINS.get(client_ip, 0) + 1
+        if FAILED_LOGINS[client_ip] < MAX_FAILED_LOGINS:
+            return False
+        FAILED_LOGINS[client_ip] = 0   # after the block ends the host starts again from zero
+        return True
+
+def reset_failures(client_ip):
+    """A correct login clears the count, so only wrong passwords in a row add up."""
+    with FAILED_LOCK:
+        FAILED_LOGINS.pop(client_ip, None)
+
+def block_host(client_ip):
+    """Ask the controller to drop all traffic from client_ip. The switch lifts the block by itself."""
+    try:
+        resp = requests.post(RYU_BLOCK, json={'src_ip': client_ip, 'reason': 'BRUTE_FORCE'},
+                             headers=API_HEADERS, timeout=5)
+        return resp.status_code == 200
+    except Exception as e:
+        logging.error(f"Block call failed for {client_ip}: {e}")
+        return False
+
 def handle_client(conn, addr):
     client_ip = addr[0]
     try:
+        # Give the client LOGIN_TIMEOUT seconds to send its login; a silent connection is closed.
+        conn.settimeout(LOGIN_TIMEOUT)
         # Receive the single payload burst from client.py
         raw_data = conn.recv(1024).decode('utf-8').strip()
         
@@ -164,6 +206,7 @@ def handle_client(conn, addr):
         
         if USER_DB.get(username) == password:
             logging.info(f"AUTH SUCCESS: User '{username}' via IP {client_ip}")
+            reset_failures(client_ip)
             if open_session(username, client_ip):
                 conn.send(f"[+] SUCCESS: Network access granted to {TARGET_IP}. "
                           f"HEARTBEAT_INTERVAL={HEARTBEAT_INTERVAL}\n".encode('utf-8'))
@@ -172,7 +215,15 @@ def handle_client(conn, addr):
                 conn.send(b"[-] ERROR: Controller refused rule injection.\n")
         else:
             logging.warning(f"AUTH FAILED: Invalid credentials from {client_ip}")
-            conn.send(b"[-] DENIED: Invalid credentials.\n")
+            if register_failure(client_ip):
+                # Tell the user first, then ask the controller to cut the host off.
+                conn.send(f"[-] BLOCKED: Too many wrong passwords. This host is blocked for "
+                          f"{BLOCK_SECONDS} seconds.\n".encode('utf-8'))
+                installed = block_host(client_ip)
+                logging.warning(f"HOST BLOCKED: {client_ip} after {MAX_FAILED_LOGINS} wrong passwords in a row, "
+                                f"drop rule {'installed' if installed else 'FAILED'}")
+            else:
+                conn.send(b"[-] DENIED: Invalid credentials.\n")
     except socket.timeout:
         logging.info(f"Connection from {client_ip} timed out and was closed.")
     except Exception as e:
