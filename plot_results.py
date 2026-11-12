@@ -5,6 +5,7 @@ The two output files are written next to the CSV. Uses matplotlib, with no displ
 """
 import csv
 import os
+import statistics
 import sys
 
 import matplotlib
@@ -29,9 +30,15 @@ def load(path):
 
 
 def mean(rows, mode, clients, column):
-    """Average of a column over the clients of one scenario; None if there is no value."""
+    """Median of a column over every client and every repeat of one scenario; None if there is no value.
+    (The median, so one unusually slow or fast run does not decide the bar. The name is kept short.)"""
     values = [float(r[column]) for r in rows if r['mode'] == mode and int(r['clients']) == clients and r[column] != '']
-    return sum(values) / len(values) if values else None
+    return statistics.median(values) if values else None
+
+
+def runs(rows):
+    """How many repeats the CSV holds."""
+    return len({r['run'] for r in rows})
 
 
 def draw(rows, path):
@@ -63,14 +70,14 @@ def draw(rows, path):
             ax.text(0.5, 0.92, 'a plain switch has no login', transform=ax.transAxes, ha='center', fontsize=9, color='#555555')
     handles, labels = axes.flat[1].get_legend_handles_labels()
     fig.legend(handles, labels, loc='lower center', ncol=2, frameon=False)
-    fig.suptitle('Plain learning switch vs access-controlled network (h4, h5 -> h3)', fontsize=13)
+    fig.suptitle('Plain learning switch vs access-controlled network (h4, h5 -> h3), median of %d runs' % runs(rows), fontsize=13)
     fig.tight_layout(rect=(0, 0.05, 1, 0.96))
     fig.savefig(path, dpi=150)
     plt.close(fig)
 
 
 def table(rows):
-    """Markdown table: one line per (mode, clients), averaged over the clients."""
+    """Markdown table: one line per (mode, clients), the median over all clients and repeats."""
     def show(v, digits):
         return '-' if v is None else '%.*f' % (digits, v)
     lines = ['| Setup | Clients | Reached h3 before login | Login (ms) | First ping (ms) | Avg ping (ms) | Throughput per client (Mbit/s) |',

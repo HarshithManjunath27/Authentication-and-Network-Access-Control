@@ -1,6 +1,7 @@
 #!/bin/bash
-# Usage: ./run_benchmark.sh      (asks for your sudo password; takes about 2 minutes)
+# Usage: ./run_benchmark.sh      (asks for your sudo password; takes about 5 minutes)
 # Measures the plain learning switch and the access-controlled setup, each with 1 and with 2 clients,
+# three times over (a fresh network every time), so the chart can use the median,
 # writes results/benchmark.csv, then draws results/benchmark.png and results/benchmark_table.md.
 cd "$(dirname "$0")"
 mkdir -p results
@@ -19,9 +20,11 @@ run_mode() {
     PYTHONPATH=. ./.venv/bin/ryu-manager "$2" > "results/ryu_$1.log" 2>&1 &
     RYU_PID=$!
     sleep 5
-    for n in 1 2; do
-        echo "--- $1, $n client(s)"
-        sudo python3 benchmark.py --mode "$1" --clients "$n" --csv results/benchmark.csv
+    for run in 1 2 3; do
+        for n in 1 2; do
+            echo "--- $1, $n client(s), run $run of 3"
+            sudo python3 benchmark.py --mode "$1" --clients "$n" --run "$run" --csv results/benchmark.csv
+        done
     done
     kill $RYU_PID 2>/dev/null
     wait $RYU_PID 2>/dev/null
